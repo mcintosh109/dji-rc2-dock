@@ -1,0 +1,2 @@
+# Add to /etc/fstab. Spaces in the share path must be written as \040.
+//NAS_IP/SHARE/path/to/DJI\040Flight\040logs  /srv/dji  cifs  credentials=/etc/smb-dji.cred,vers=3.0,iocharset=utf8,file_mode=0664,dir_mode=0775,_netdev,nofail,x-systemd.automount  0  0

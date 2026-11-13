@@ -1,0 +1,7 @@
+[Unit]
+Description=Sync DJI RC 2 flight logs
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 8
+ExecStart=/usr/local/bin/dji-sync.sh

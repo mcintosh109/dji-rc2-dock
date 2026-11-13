@@ -1,0 +1,2 @@
+# DJI RC 2 (vendor 2ca3, product 1021). Check yours with `lsusb`.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2ca3", ATTR{idProduct}=="1021", TAG+="systemd", ENV{SYSTEMD_WANTS}="dji-sync.service"
