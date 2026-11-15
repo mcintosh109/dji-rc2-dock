@@ -19,7 +19,9 @@ check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then echo "  PASS  $nam
 mkdir -p "$T/bin" "$T/rc2-files" "$T/mnt" "$T/storage"
 cat > "$T/bin/jmtpfs" <<EOF
 #!/bin/bash
-# fake controller: "mount" = copy the fake controller's files into place
+# fake controller: "mount" = copy the fake controller's files into place.
+# While $T/locked exists it acts like a locked controller and fails.
+[ -e "$T/locked" ] && { echo "no MTP device found" >&2; exit 1; }
 mkdir -p "\$1/Internal shared storage/DJI/dji.go.v5/FlightRecord"
 cp -p "$T/rc2-files/"* "\$1/Internal shared storage/DJI/dji.go.v5/FlightRecord/" 2>/dev/null
 echo mounted >> "$T/mounts"
@@ -31,12 +33,14 @@ EOF
 cat > "$T/bin/dji-log" <<'EOF'
 #!/bin/bash
 # fake parser: --api-key K --csv C --geojson G FILE. Writes slowly (so the
-# test can look for half-written files) and fails for files named *BROKEN*.
+# test can look for half-written files) and fails for files named *BROKEN*,
+# or for every file when FAKE_OFFLINE is set (like having no internet).
 while [ $# -gt 1 ]; do case "$1" in --csv) csv=$2; shift;; --geojson) geo=$2; shift;; esac; shift; done
 file=$1
 echo "partial" > "$csv"
 sleep "${FAKE_PARSE_SECONDS:-0}"
 case "$file" in *BROKEN*) exit 1;; esac
+[ -n "${FAKE_OFFLINE:-}" ] && { echo "network error" >&2; exit 1; }
 echo "csv for $(basename "$file") END" > "$csv"
 echo "geojson END" > "$geo"
 EOF
@@ -110,6 +114,55 @@ bash "$SYNC"
 check "second sync is skipped" grep -q "another sync is already running" "$T/sync.log"
 check "  ...and changed nothing" bash -c "! ls '$T'/storage/raw/FlightRecord_2026-01-14_F.txt"
 wait "$holder"
+
+echo "Parse fails (no internet), then is retried on the next dock"
+flight FlightRecord_2026-01-15_G
+FAKE_OFFLINE=1 bash "$SYNC"; code=$?
+check "a failed parse still counts as success (exit 0)" [ "$code" -eq 0 ]
+check "the log says it will retry" grep -q "parse failed: FlightRecord_2026-01-15_G (will retry on next dock)" "$T/sync.log"
+check "no CSV yet" bash -c "! ls '$T'/storage/parsed/FlightRecord_2026-01-15_G.csv"
+bash "$SYNC"
+check "parsed on the next dock, with nothing new to copy" grep -q "parsed: FlightRecord_2026-01-15_G" "$T/sync.log"
+check "  ...and its parsed files went into the session holding its raw log" \
+  bash -c "ls '$T'/storage/archive/[0-9]*/parsed/FlightRecord_2026-01-15_G.csv"
+check "  ...with no hidden leftovers" bash -c "! find '$T/storage' -name '.*' | grep -q ."
+
+echo "Controller locked at first, then unlocked"
+touch "$T/locked"
+( sleep 1; rm -f "$T/locked" ) &
+DJI_UNLOCK_WAIT=10 DJI_RETRY_EVERY=1 bash "$SYNC"; code=$?
+wait
+check "waited for the controller to be unlocked" grep -q "waiting for the controller to be unlocked" "$T/sync.log"
+check "  ...then synced normally (exit 0)" [ "$code" -eq 0 ]
+
+echo "Controller never unlocked"
+touch "$T/locked"
+DJI_UNLOCK_WAIT=1 DJI_RETRY_EVERY=1 bash "$SYNC"; code=$?
+rm -f "$T/locked"
+check "gives up with exit code 1" [ "$code" -eq 1 ]
+check "  ...and says why in the log" grep -q "FlightRecord folder not found after 1s" "$T/sync.log"
+check "  ...including the last mount error" grep -q "last mount error: no MTP device found" "$T/sync.log"
+
+echo "Copy fails partway"
+printf '#!/bin/bash\necho "rsync: connection unexpectedly closed" >&2\nexit 12\n' > "$T/bin/rsync"
+chmod +x "$T/bin/rsync"
+bash "$SYNC"; code=$?
+rm -f "$T/bin/rsync"
+check "exit code 1" [ "$code" -eq 1 ]
+check "the log says the copy failed" grep -q "copy failed (rsync exit code 12)" "$T/sync.log"
+
+echo "Stopped partway (e.g. the 30 minute time limit)"
+printf '#!/bin/bash\nsleep 5\n' > "$T/bin/rsync"
+chmod +x "$T/bin/rsync"
+bash "$SYNC" & pid=$!
+sleep 1
+# systemd stops every process of the service, so stop the fake rsync too
+pkill -TERM -f "$T/bin/rsync"; kill -TERM "$pid"
+wait "$pid"; code=$?
+rm -f "$T/bin/rsync"
+check "exit code 1" [ "$code" -eq 1 ]
+check "the log says it was stopped" grep -q "stopped before finishing" "$T/sync.log"
+check "  ...and the controller was unmounted" bash -c "[ \"\$(tail -n1 '$T/mounts')\" = unmounted ]"
 
 echo
 echo "$PASSED passed, $FAILED failed"
