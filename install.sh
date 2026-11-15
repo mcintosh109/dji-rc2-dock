@@ -25,11 +25,17 @@ install -m 755 dji-sync.sh /usr/local/bin/dji-sync.sh
 install -m 644 dji-sync.service /etc/systemd/system/dji-sync.service
 install -m 644 99-dji-rc2.rules /etc/udev/rules.d/99-dji-rc2.rules
 install -m 644 dji-sync.logrotate /etc/logrotate.d/dji-sync
-mkdir -p /mnt/rc2 /srv/dji
+install -m 644 dji-sync-flush.service /etc/systemd/system/dji-sync-flush.service
+install -m 644 dji-sync-flush.timer /etc/systemd/system/dji-sync-flush.timer
+# /var/lib/dji-dock holds the cache: logs waiting to be pushed to the NAS
+mkdir -p /mnt/rc2 /srv/dji /var/lib/dji-dock/cache
 
 # Tell systemd and udev to load the new files
 systemctl daemon-reload
 udevadm control --reload-rules
+
+# Start the 15 minute timer now, and at every boot
+systemctl enable --now dji-sync-flush.timer
 
 if [ ! -f /etc/dji-api-key ]; then
   # [ -t 0 ] is true when someone is typing at a terminal

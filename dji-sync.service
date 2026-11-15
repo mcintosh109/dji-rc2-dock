@@ -1,8 +1,8 @@
 [Unit]
-Description=Sync DJI RC 2 flight logs
-# Don't run until the storage at /srv/dji is mounted
-RequiresMountsFor=/srv/dji
-# Parsing needs the internet, so start after the network is up
+Description=Sync DJI RC 2 flight logs (started when the controller is plugged in)
+# Parsing needs the internet, so start after the network is up.
+# The NAS is NOT required: if it is down, the logs wait in the cache on
+# the Pi, and dji-sync-flush.timer pushes them when the NAS is back.
 Wants=network-online.target
 After=network-online.target
 
