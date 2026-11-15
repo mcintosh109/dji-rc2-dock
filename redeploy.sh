@@ -8,14 +8,15 @@
 #   /etc/fstab                         where your storage is mounted (the upload location)
 #   /etc/systemd/system/dji-sync.service.d/   your own service settings, if any
 #   /srv/dji                           your flight logs (raw, parsed, archive)
+#   /var/lib/dji-dock                  the cache on the Pi (logs waiting for the NAS)
 #   /var/log/dji-sync.log              the sync log
 #
 # CLEANED UP:
-#   1. a sync that is running is stopped
+#   1. a sync that is running (dock or 15 minute push) is stopped
 #   2. the controller is unmounted, if a crashed sync left it mounted
 #   3. the old lock file is removed
-#   4. the installed script, service, udev rule and log rotation file are
-#      removed (uninstall.sh) ...
+#   4. the installed script, services, timer, udev rule and log rotation
+#      file are removed (uninstall.sh) ...
 #   5. ... and installed fresh (install.sh)
 #   6. then everything is checked, including that the KEPT files are unchanged
 
@@ -44,7 +45,8 @@ fingerprint() {
 
 # ---- Before removing anything, make sure the reinstall can work -------------
 echo "== Checking this folder has everything needed..."
-for f in install.sh uninstall.sh dji-sync.sh dji-sync.service 99-dji-rc2.rules dji-sync.logrotate; do
+for f in install.sh uninstall.sh dji-sync.sh dji-sync.service dji-sync-flush.service \
+         dji-sync-flush.timer 99-dji-rc2.rules dji-sync.logrotate; do
   if [ ! -f "$f" ]; then
     echo "Missing $f - nothing was changed. Run this from the dji-rc2-dock folder."
     exit 1
@@ -63,14 +65,21 @@ BEFORE=$(fingerprint)
 
 # ---- 1. Stop a sync that is running ------------------------------------------
 echo "== 1. Stopping any running sync..."
-if systemctl is-active --quiet dji-sync.service; then
-  systemctl stop dji-sync.service
-  echo "   A sync was running and has been stopped. Dock again afterwards to finish it."
+STOPPED=no
+for unit in dji-sync.service dji-sync-flush.service; do
+  if systemctl is-active --quiet "$unit"; then
+    systemctl stop "$unit"
+    STOPPED=yes
+  fi
+  # Forget an earlier "failed" result, so `systemctl status` starts clean
+  systemctl reset-failed "$unit" 2>/dev/null || true
+done
+if [ "$STOPPED" = yes ]; then
+  echo "   A sync was running and has been stopped. Logs already copied are kept;"
+  echo "   dock again afterwards to finish it."
 else
   echo "   No sync running."
 fi
-# Forget an earlier "failed" result, so `systemctl status` starts clean
-systemctl reset-failed dji-sync.service 2>/dev/null || true
 
 # ---- 2. Unmount the controller if it was left mounted ------------------------
 echo "== 2. Checking for a leftover controller mount..."
@@ -106,6 +115,7 @@ else
 fi
 
 for f in /usr/local/bin/dji-sync.sh /etc/systemd/system/dji-sync.service \
+         /etc/systemd/system/dji-sync-flush.service /etc/systemd/system/dji-sync-flush.timer \
          /etc/udev/rules.d/99-dji-rc2.rules /etc/logrotate.d/dji-sync; do
   if [ -f "$f" ]; then
     echo "   OK   installed $f"
@@ -122,6 +132,13 @@ else
   PROBLEMS=1
 fi
 
+if systemctl is-active --quiet dji-sync-flush.timer; then
+  echo "   OK   the 15 minute push timer is running"
+else
+  echo "   !!   the 15 minute push timer is not running"
+  PROBLEMS=1
+fi
+
 # Report on the storage, without changing it. Looking inside connects an
 # automount share.
 ls "$BASE" >/dev/null 2>&1 || true
@@ -130,8 +147,14 @@ TARGET=$(findmnt -n -o TARGET -T "$BASE" 2>/dev/null | tail -1)
 if [ "$TARGET" = "$BASE" ] && [ "$FSTYPE" != autofs ]; then
   echo "   OK   storage is mounted at $BASE ($FSTYPE)"
 else
-  echo "   !!   storage is not mounted at $BASE - the sync won't run until it is (try: sudo mount -a)"
+  echo "   !!   storage is not mounted at $BASE - logs will wait in the cache on the Pi until it is (try: sudo mount -a)"
   PROBLEMS=1
+fi
+
+# Logs waiting in the cache are reported, never deleted
+WAITING=$(find /var/lib/dji-dock/cache -type f -not -name '.*' 2>/dev/null | wc -l)
+if [ "$WAITING" -gt 0 ]; then
+  echo "   note $WAITING log(s) waiting in the cache on the Pi - pushed to the NAS within 15 minutes"
 fi
 
 # Unfinished archive folders are reported, never deleted

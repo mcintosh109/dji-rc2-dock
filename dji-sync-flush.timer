@@ -1,0 +1,10 @@
+[Unit]
+Description=Every 15 minutes, push DJI flight logs waiting in the Pi's cache to the NAS
+
+[Timer]
+# First run 5 minutes after the Pi starts, then every 15 minutes
+OnBootSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

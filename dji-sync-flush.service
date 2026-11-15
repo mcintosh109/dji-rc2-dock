@@ -1,0 +1,9 @@
+[Unit]
+Description=Push DJI flight logs waiting in the Pi's cache to the NAS
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dji-sync.sh --flush
+TimeoutStartSec=30min

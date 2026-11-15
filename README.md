@@ -6,7 +6,11 @@ Turns a Raspberry Pi into a dock for the DJI RC 2 controller. Plug the controlle
 
 1. A udev rule detects the RC 2 when it's plugged in over USB.
 2. It starts a systemd service, which runs `dji-sync.sh`.
-3. The script mounts the controller over MTP, copies new logs with rsync (never overwriting or deleting), parses them with [dji-log-parser](https://github.com/lvauvillier/dji-log-parser), and archives the session.
+3. The script mounts the controller over MTP and copies new logs with rsync into a **cache on the Pi's SD card** (`/var/lib/dji-dock/cache`). This works even if the NAS is down. Then it unmounts the controller.
+4. If the NAS is mounted, it pushes the cache to the NAS, deletes each cached log once it's confirmed identical on the NAS, parses new logs with [dji-log-parser](https://github.com/lvauvillier/dji-log-parser), and archives the session.
+5. If the NAS is down, the logs wait in the cache. A timer (`dji-sync-flush.timer`) checks every 15 minutes and pushes them as soon as the NAS is back, without re-docking.
+
+Nothing is ever overwritten or deleted on the controller or the NAS.
 
 ## Output layout
 
@@ -73,7 +77,7 @@ It does these steps:
 5. Installs everything fresh.
 6. Checks the result.
 
-**It never changes** your API key (`/etc/dji-api-key`), share credentials (`/etc/smb-dji.cred`), storage settings (`/etc/fstab`), your own service settings, your flight logs in `/srv/dji`, or the log file. It compares the key, credentials and fstab before and after, and warns with `!!` if any of them changed. If the packages can't be installed (for example, with no internet), it stops before removing anything.
+**It never changes** your API key (`/etc/dji-api-key`), share credentials (`/etc/smb-dji.cred`), storage settings (`/etc/fstab`), your own service settings, your flight logs in `/srv/dji`, the cache on the Pi (`/var/lib/dji-dock`), or the log file. It compares the key, credentials and fstab before and after, and warns with `!!` if any of them changed. If the packages can't be installed (for example, with no internet), it stops before removing anything.
 
 ## Uninstall
 
@@ -81,7 +85,7 @@ It does these steps:
 sudo ./uninstall.sh
 ```
 
-This removes the installed script, service, udev rule and log rotation settings. Your flight logs, API key and log file are kept; the uninstaller lists where they are.
+This stops the 15 minute timer and removes the installed script, services, timer, udev rule and log rotation settings. Your flight logs, the cache on the Pi, API key and log file are kept; the uninstaller lists where they are, and warns if logs in the cache were never pushed to the NAS.
 
 ## Tests
 
@@ -97,23 +101,37 @@ Each problem below shows the message you'll see in `/var/log/dji-sync.log`, or w
 
 **Nothing appears in the log after plugging in**
 - Check the Pi sees the controller: `lsusb` should list `2ca3:1021`.
-- Check the service: `systemctl status dji-sync.service`. If the storage at `/srv/dji` couldn't be mounted, the sync doesn't start, and the error shows here.
+- Check the service: `systemctl status dji-sync.service`.
 - Full service messages: `journalctl -u dji-sync.service`
 
 **`FlightRecord folder not found after 120s`**
 - Unlock the controller, then unplug and replug it.
 - Make sure the USB cable carries data, not just charge.
 
-**`copy failed`**
+**`copy from the controller failed`**
 - The USB connection dropped. Check the cable and hub, then dock again. Logs fully copied before the error are kept.
 
-**`storage is not mounted at /srv/dji`** or **`cannot create folders in /srv/dji`**
+**`storage is not mounted at /srv/dji - N log(s) kept in the cache on the Pi`**
+- Your logs are safe on the Pi. They're pushed automatically within 15 minutes of the NAS coming back, and the log then says `storage is back - pushing N cached log(s)`.
+- To see what's waiting: `ls /var/lib/dji-dock/cache`
 - Check the storage with `findmnt /srv/dji`. If nothing is shown, run `sudo mount -a` and look for an error.
-- If you keep logs on the Pi's own SD card on purpose (no separate storage), allow that with `sudo systemctl edit dji-sync.service`, adding these two lines:
+- If you keep logs on the Pi's own SD card on purpose (no separate storage), allow that for both services. Run `sudo systemctl edit dji-sync.service`, then `sudo systemctl edit dji-sync-flush.service`, adding these two lines in each:
   ```ini
   [Service]
   Environment=DJI_REQUIRE_MOUNT=0
   ```
+
+**`push to the NAS failed`**
+- The NAS connection dropped during the push. The logs stay in the cache and are pushed again within 15 minutes.
+
+**`not confirmed on the NAS yet, kept in the cache: ...`**
+- The NAS already has a different file with the same name, so it was not overwritten, and the cached copy is kept. Compare the two files (in `/var/lib/dji-dock/cache` and `/srv/dji/raw`), keep the right one, and delete the other.
+
+**`cannot create folders in /srv/dji`**
+- The storage is mounted but can't be written to. Check the share's permissions, and that the NAS isn't full.
+
+**Checking the 15 minute timer**
+- `systemctl list-timers dji-sync-flush.timer` shows when it last ran and when it runs next.
 
 **`another sync is already running - skipped`**
 - Only one sync runs at a time. Wait for the first one to finish (`tail -f /var/log/dji-sync.log`), then dock again if needed.
@@ -134,7 +152,8 @@ Each problem below shows the message you'll see in `/var/log/dji-sync.log`, or w
 
 - The controller must be unlocked for its storage to be visible over MTP.
 - Parsing needs internet access: the parser fetches each log's decryption key from DJI. The logs themselves stay local.
-- Only flights that are new since the last dock are copied and archived.
+- Only flights that are new since the last dock are copied and archived. The Pi remembers which logs it already uploaded in `/var/lib/dji-dock/uploaded.list`, so they aren't copied from the controller again even after they leave the cache. To upload everything on the controller again, delete that file.
+- The first dock after updating from a version without the cache copies every log on the controller into the cache once. Logs already on the NAS are recognised and not duplicated.
 - Any log without a CSV yet is parsed on every dock, so a log that failed to parse (for example with no internet) is retried next time. Its parsed files go into the archive folder that holds its raw log.
 - Nothing is ever overwritten, and nothing appears half-written to programs that read `archive/` (like DJI Flight Map): each dock's session is built in a hidden `archive/.incoming-...` folder and renamed into place only when complete, and single files are written under a hidden name and renamed when complete.
 - The log file is rotated monthly, and the last 12 months are kept (`/etc/logrotate.d/dji-sync`).

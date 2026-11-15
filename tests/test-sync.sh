@@ -47,7 +47,7 @@ EOF
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export DJI_MNT="$T/mnt" DJI_BASE="$T/storage" DJI_LOG="$T/sync.log" DJI_LOCK="$T/sync.lock" \
-       DJI_APIKEY_FILE="$T/apikey" DJI_REQUIRE_MOUNT=0
+       DJI_APIKEY_FILE="$T/apikey" DJI_REQUIRE_MOUNT=0 DJI_STATE="$T/state"
 echo "TESTKEY" > "$T/apikey"
 flight() { echo "raw $1" > "$T/rc2-files/$1.txt"; }
 sessions() { find "$T/storage/archive" -mindepth 1 -maxdepth 1 -type d -not -name '.*' | wc -l; }
@@ -55,8 +55,8 @@ hidden_left() { find "$T/storage" -name '.*' -not -name '.' | grep -q .; }
 
 echo "Storage not mounted"
 DJI_REQUIRE_MOUNT=1 bash "$SYNC"; code=$?
-check "refuses when the storage isn't mounted" [ "$code" -eq 1 ]
-check "  ...and writes nothing" bash -c "[ -z \"\$(ls -A '$T/storage')\" ]"
+check "exits 0 (any logs wait safely in the cache)" [ "$code" -eq 0 ]
+check "  ...and writes nothing to the storage" bash -c "[ -z \"\$(ls -A '$T/storage')\" ]"
 check "  ...and says why in the log" grep -q "storage is not mounted" "$T/sync.log"
 
 echo "First dock"
@@ -101,6 +101,9 @@ check "the existing folder was not touched" bash -c "for f in '$T'/storage/archi
 echo "Raw folder cleared, then docked again"
 echo "MARK" >> "$T/storage/parsed/FlightRecord_2026-01-10_A.csv"
 rm -rf "$T/storage/raw"
+# The Pi remembers which logs it already uploaded; forget that too, so
+# everything is copied from the controller again.
+rm -f "$T/state/uploaded.list"
 bash "$SYNC"
 check "already-parsed flights are not parsed again" grep -q "already parsed: FlightRecord_2026-01-10_A" "$T/sync.log"
 check "their parsed files are not replaced" grep -q MARK "$T/storage/parsed/FlightRecord_2026-01-10_A.csv"
@@ -110,7 +113,7 @@ echo "Two syncs at once"
 flight FlightRecord_2026-01-14_F
 ( flock 9; sleep 2 ) 9>"$T/sync.lock" & holder=$!
 sleep 0.3
-bash "$SYNC"
+DJI_LOCK_WAIT=0 bash "$SYNC"
 check "second sync is skipped" grep -q "another sync is already running" "$T/sync.log"
 check "  ...and changed nothing" bash -c "! ls '$T'/storage/raw/FlightRecord_2026-01-14_F.txt"
 wait "$holder"
@@ -149,7 +152,7 @@ chmod +x "$T/bin/rsync"
 bash "$SYNC"; code=$?
 rm -f "$T/bin/rsync"
 check "exit code 1" [ "$code" -eq 1 ]
-check "the log says the copy failed" grep -q "copy failed (rsync exit code 12)" "$T/sync.log"
+check "the log says the copy failed" grep -q "copy from the controller failed (rsync exit code 12)" "$T/sync.log"
 
 echo "Stopped partway (e.g. the 30 minute time limit)"
 printf '#!/bin/bash\nsleep 5\n' > "$T/bin/rsync"
@@ -163,6 +166,87 @@ rm -f "$T/bin/rsync"
 check "exit code 1" [ "$code" -eq 1 ]
 check "the log says it was stopped" grep -q "stopped before finishing" "$T/sync.log"
 check "  ...and the controller was unmounted" bash -c "[ \"\$(tail -n1 '$T/mounts')\" = unmounted ]"
+
+cached() { find "$T/state/cache" -type f | wc -l; }
+
+echo "NAS down when docking: logs wait in the cache on the Pi"
+flight "DJIFlightRecord_2026-02-01_[10-00-00]"; flight FlightRecord_2026-02-01_H
+DJI_REQUIRE_MOUNT=1 bash "$SYNC"; code=$?
+check "exit 0 (the logs are safe)" [ "$code" -eq 0 ]
+check "both logs are in the cache" bash -c "ls '$T/state/cache/DJIFlightRecord_2026-02-01_[10-00-00].txt' '$T/state/cache/FlightRecord_2026-02-01_H.txt'"
+check "  ...and not on the NAS yet" bash -c "! ls '$T'/storage/raw/FlightRecord_2026-02-01_H.txt"
+check "  ...and the controller was unmounted" bash -c "[ \"\$(tail -n1 '$T/mounts')\" = unmounted ]"
+check "the log says they are kept in the cache" grep -q "log(s) kept in the cache on the Pi" "$T/sync.log"
+
+echo "15 minute flush while the NAS is still down"
+before=$(grep -c "storage is not mounted" "$T/sync.log")
+DJI_REQUIRE_MOUNT=1 bash "$SYNC" --flush; code=$?
+DJI_REQUIRE_MOUNT=1 bash "$SYNC" --flush
+check "exit 0" [ "$code" -eq 0 ]
+check "the logs stay in the cache" [ "$(cached)" -eq 2 ]
+check "the NAS being down isn't logged again every 15 minutes" [ "$(grep -c "storage is not mounted" "$T/sync.log")" -eq "$before" ]
+
+echo "15 minute flush once the NAS is back"
+bash "$SYNC" --flush; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "the log says the storage is back" grep -q "storage is back - pushing 2 cached log(s)" "$T/sync.log"
+check "both logs are on the NAS" bash -c "ls '$T/storage/raw/DJIFlightRecord_2026-02-01_[10-00-00].txt' '$T/storage/raw/FlightRecord_2026-02-01_H.txt'"
+check "  ...archived as a session" bash -c "ls '$T'/storage/archive/[0-9]*/raw/FlightRecord_2026-02-01_H.txt"
+check "  ...and parsed" bash -c "ls '$T'/storage/parsed/FlightRecord_2026-02-01_H.csv"
+check "the cache is now empty" [ "$(cached)" -eq 0 ]
+check "uploaded.list remembers them (brackets and all)" grep -qxF "DJIFlightRecord_2026-02-01_[10-00-00].txt" "$T/state/uploaded.list"
+
+echo "Dock again: uploaded logs are not copied from the controller again"
+bash "$SYNC"
+check "the cache stays empty" [ "$(cached)" -eq 0 ]
+check "the log says 0 logs in the cache" bash -c "tail -n 5 '$T/sync.log' | grep -q '0 log(s) in the cache'"
+
+echo "15 minute flush with nothing waiting"
+size=$(wc -c < "$T/sync.log")
+bash "$SYNC" --flush; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "  ...and writes nothing to the log" [ "$(wc -c < "$T/sync.log")" -eq "$size" ]
+
+echo "A cached log that differs from the NAS copy is kept"
+mkdir -p "$T/state/cache"
+echo "pi version" > "$T/state/cache/FlightRecord_2026-02-02_K.txt"
+echo "nas version" > "$T/storage/raw/FlightRecord_2026-02-02_K.txt"
+bash "$SYNC" --flush
+check "kept in the cache" bash -c "grep -qx 'pi version' '$T/state/cache/FlightRecord_2026-02-02_K.txt'"
+check "  ...the NAS copy is not overwritten" bash -c "grep -qx 'nas version' '$T/storage/raw/FlightRecord_2026-02-02_K.txt'"
+check "  ...and the log says why" grep -q "not confirmed on the NAS yet, kept in the cache: FlightRecord_2026-02-02_K.txt" "$T/sync.log"
+rm -f "$T/state/cache/FlightRecord_2026-02-02_K.txt"
+
+echo "Docking while a flush is running: the dock waits, then syncs"
+flight FlightRecord_2026-02-03_I
+( flock 9; sleep 2 ) 9>"$T/sync.lock" & holder=$!
+sleep 0.3
+DJI_LOCK_WAIT=10 bash "$SYNC"; code=$?
+wait "$holder"
+check "the dock waited, then synced (exit 0)" [ "$code" -eq 0 ]
+check "  ...and the new log is on the NAS" bash -c "ls '$T'/storage/raw/FlightRecord_2026-02-03_I.txt"
+
+echo "A flush while another sync is running skips its turn"
+echo "raw J" > "$T/state/cache/FlightRecord_2026-02-04_J.txt"
+( flock 9; sleep 2 ) 9>"$T/sync.lock" & holder=$!
+sleep 0.3
+bash "$SYNC" --flush; code=$?
+check "exit 0 straight away" [ "$code" -eq 0 ]
+check "  ...and leaves the cache alone" bash -c "ls '$T'/state/cache/FlightRecord_2026-02-04_J.txt"
+wait "$holder"
+bash "$SYNC" --flush
+check "the next flush pushes it" bash -c "ls '$T'/storage/raw/FlightRecord_2026-02-04_J.txt"
+
+echo "First dock after updating from a version without the cache"
+# Simulate the update: the Pi has no cache or uploaded.list yet, but the
+# NAS already has every log on the controller.
+rm -rf "$T/state"
+s_before=$(sessions)
+bash "$SYNC"; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "logs already on the NAS are not archived again" [ "$(sessions)" -eq "$s_before" ]
+check "  ...the cache is empty again afterwards" [ "$(cached)" -eq 0 ]
+check "  ...and they are remembered as uploaded" grep -qxF "FlightRecord_2026-01-10_A.txt" "$T/state/uploaded.list"
 
 echo
 echo "$PASSED passed, $FAILED failed"

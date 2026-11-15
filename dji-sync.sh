@@ -1,11 +1,22 @@
 #!/bin/bash
-# DJI RC 2 flight log sync: copies new logs to storage, parses them,
-# and archives each dock session's raw + parsed files.
+# DJI RC 2 flight log sync.
+#
+#   dji-sync.sh           dock mode: run by udev when the controller is plugged in
+#   dji-sync.sh --flush   flush mode: run every 15 minutes by dji-sync-flush.timer
+#
+# Dock mode copies new logs from the controller into a cache on the Pi's
+# SD card (/var/lib/dji-dock/cache), unmounts the controller, then pushes
+# the cache to the NAS. If the NAS is down, the logs wait safely in the
+# cache, and flush mode pushes them once the NAS is back.
+#
+# Pushing to the NAS: copies the cached logs into raw/, deletes each cached
+# log once it is confirmed identical on the NAS, then parses new logs and
+# archives them as a dock session.
 #
 # Safeguards, so nothing other tools read (like DJI Flight Map, which reads
 # archive/) is ever overwritten or seen half-written:
-#   - stops if the storage isn't really mounted at /srv/dji, instead of
-#     silently filling the Pi's SD card
+#   - never writes to /srv/dji unless the storage is really mounted there,
+#     instead of silently filling the Pi's SD card
 #   - only one sync runs at a time (a lock)
 #   - never overwrites: raw logs are copied with --ignore-existing, a new
 #     archive folder gets another name if one already exists, and copies
@@ -13,6 +24,7 @@
 #   - files are written under a hidden name and renamed when complete, and
 #     each dock session is built in a hidden folder (archive/.incoming-...)
 #     that is renamed into archive/ only when everything is finished
+#   - a cached log is only deleted after it is confirmed identical on the NAS
 #   - flights that already have a parsed CSV are not parsed again
 #   - flights that failed to parse (e.g. no internet) are retried on every
 #     dock until they succeed
@@ -21,10 +33,11 @@
 #     the sync is stopped, and a mount left by an interrupted run is removed
 #
 # Exit codes (shown by `systemctl status dji-sync.service`):
-#   0 = success, or nothing to do. A failed parse still counts as
-#       success, because it is retried on the next dock.
-#   1 = the storage or controller could not be reached, the copy failed,
-#       the session could not be archived, or the sync was stopped.
+#   0 = success, nothing to do, or the NAS is down and the logs are waiting
+#       safely in the cache. A failed parse also counts as success, because
+#       it is retried.
+#   1 = the controller could not be reached, a copy failed, the session
+#       could not be archived, or the sync was stopped.
 set -u
 
 # The DJI_* variables are only for the tests (tests/test-sync.sh).
@@ -33,22 +46,39 @@ BASE=${DJI_BASE:-/srv/dji}
 RAW=$BASE/raw
 PARSED=$BASE/parsed
 ARCHIVE=$BASE/archive
+STATE=${DJI_STATE:-/var/lib/dji-dock}  # on the Pi's SD card
+CACHE=$STATE/cache                     # logs waiting to be pushed to the NAS
+UPLOADED=$STATE/uploaded.list          # logs already pushed: not copied from the controller again
+NAS_DOWN=$STATE/nas-down               # exists while the NAS is unreachable (so it is logged once)
 LOG=${DJI_LOG:-/var/log/dji-sync.log}
 APIKEY_FILE=${DJI_APIKEY_FILE:-/etc/dji-api-key}
 LOCK=${DJI_LOCK:-/run/dji-sync.lock}
+LOCK_WAIT=${DJI_LOCK_WAIT:-300}         # dock mode: seconds to wait for a running sync to finish
 REQUIRE_MOUNT=${DJI_REQUIRE_MOUNT:-1}   # 0 = /srv/dji is a plain local folder on purpose
 UNLOCK_WAIT=${DJI_UNLOCK_WAIT:-120}     # seconds to wait for the controller to be unlocked
 RETRY_EVERY=${DJI_RETRY_EVERY:-10}      # seconds between tries while waiting
 STAMP=$(date +%Y-%m-%d_%H-%M-%S)
-NEWLIST=$(mktemp)
+
+MODE=dock
+[ "${1:-}" = "--flush" ] && MODE=flush
 
 log() { echo "$(date) - $*" >> "$LOG"; }
 
+NEWLIST=$(mktemp)
+EXCLUDE=$(mktemp)
+
 # ---- Only one sync at a time -------------------------------------------------
+# Docking waits for a running sync (such as a 15 minute flush) to finish.
+# A flush simply skips its turn if anything else is running.
 exec 9>"$LOCK"
-if ! flock -n 9; then
-  log "another sync is already running - skipped"
-  rm -f "$NEWLIST"
+if [ "$MODE" = dock ]; then
+  flock -w "$LOCK_WAIT" 9; GOT_LOCK=$?
+else
+  flock -n 9; GOT_LOCK=$?
+fi
+if [ "$GOT_LOCK" -ne 0 ]; then
+  [ "$MODE" = dock ] && log "another sync is already running - skipped"
+  rm -f "$NEWLIST" "$EXCLUDE"
   exit 0
 fi
 
@@ -69,30 +99,105 @@ unmount_rc() {
 # cleanup runs whenever the script ends, however it ends.
 cleanup() {
   unmount_rc
-  rm -f "$NEWLIST"
+  rm -f "$NEWLIST" "$EXCLUDE"
 }
 trap cleanup EXIT
 # If systemd stops the script (e.g. the time limit is hit), exit normally
 # so that cleanup still runs.
 trap 'log "stopped before finishing (time limit or shutdown)"; exit 1' TERM INT
 
-log "RC 2 detected"
+# How many logs are waiting in the cache (hidden temporary files don't count)
+cached_count() { find "$CACHE" -type f -not -name '.*' 2>/dev/null | wc -l; }
+
+if ! mkdir -p "$CACHE" 2>> "$LOG"; then
+  log "cannot create the cache folder $CACHE"
+  exit 1
+fi
+touch "$UPLOADED"
+
+# ==== Dock mode: controller -> cache ===========================================
+if [ "$MODE" = dock ]; then
+  log "RC 2 detected"
+  mkdir -p "$MNT"
+
+  # A mount left behind by an interrupted run would block a new one
+  if rc_mounted; then
+    log "removing leftover mount at $MNT"
+    unmount_rc
+  fi
+
+  # Mount the controller and find its logs. The storage is only visible
+  # once the controller is unlocked, so keep retrying every RETRY_EVERY
+  # seconds until UNLOCK_WAIT runs out.
+  SRC=""
+  WAITED=0
+  while true; do
+    if MOUNT_ERR=$(jmtpfs "$MNT" 2>&1); then
+      MOUNTED=yes
+      SRC=$(find "$MNT" -maxdepth 6 -type d -name FlightRecord 2>/dev/null | head -n1)
+      [ -n "$SRC" ] && break
+      unmount_rc
+    fi
+    if [ "$WAITED" -ge "$UNLOCK_WAIT" ]; then
+      [ -n "$MOUNT_ERR" ] && log "last mount error: $MOUNT_ERR"
+      log "FlightRecord folder not found after ${UNLOCK_WAIT}s - is the controller plugged in and unlocked?"
+      exit 1
+    fi
+    [ "$WAITED" -eq 0 ] && log "waiting for the controller to be unlocked..."
+    sleep "$RETRY_EVERY"
+    WAITED=$((WAITED + RETRY_EVERY))
+  done
+
+  # Skip logs that were already pushed to the NAS. uploaded.list holds
+  # their names; rsync treats [ ] * ? in names as wildcards, so a
+  # backslash is put in front of each, and / anchors each name to the top.
+  sed -e 's/[][*?]/\\&/g' -e 's|^|/|' "$UPLOADED" > "$EXCLUDE"
+
+  # Copy new logs into the cache. rsync writes each file under a temporary
+  # name and renames it when done. Its exit code is saved straight away,
+  # because the next command would overwrite $?.
+  rsync -rt --ignore-existing --exclude 'si_cache' --exclude-from="$EXCLUDE" \
+    "$SRC"/ "$CACHE"/ 2>> "$LOG"
+  RSYNC_STATUS=$?
+  unmount_rc   # finished with the controller
+  if [ "$RSYNC_STATUS" -ne 0 ]; then
+    log "copy from the controller failed (rsync exit code $RSYNC_STATUS) - logs fully copied before the error are kept"
+  fi
+  log "$(cached_count) log(s) in the cache on the Pi"
+  # From here on, a copy error means exit code 1 at the end
+  COPY_FAILED=$RSYNC_STATUS
+else
+  # Flush mode: quietly do nothing if no logs are waiting
+  [ "$(cached_count)" -eq 0 ] && exit 0
+  COPY_FAILED=0
+fi
+
+# ==== Cache -> NAS ===============================================================
 
 # ---- Is the storage really there? --------------------------------------------
 # Looking inside the folder connects an automount share. If /srv/dji still
 # isn't its own mount afterwards (or is only the empty automount point), the
-# share isn't connected: stop, rather than writing to the SD card.
+# share isn't connected: keep the logs in the cache, rather than writing to
+# the SD card's /srv/dji folder.
 ls "$BASE" >/dev/null 2>&1
 if [ "$REQUIRE_MOUNT" = 1 ]; then
   target=$(findmnt -n -o TARGET -T "$BASE" 2>/dev/null | tail -1)
   fstype=$(findmnt -n -o FSTYPE -T "$BASE" 2>/dev/null | tail -1)
   if [ "$target" != "$BASE" ] || [ "$fstype" = autofs ]; then
-    log "storage is not mounted at $BASE - nothing copied (is the NAS on? try: sudo mount -a)"
-    exit 1
+    # Log this once, not every 15 minutes
+    if [ "$MODE" = dock ] || [ ! -e "$NAS_DOWN" ]; then
+      log "storage is not mounted at $BASE - $(cached_count) log(s) kept in the cache on the Pi, retrying every 15 minutes (is the NAS on? try: sudo mount -a)"
+    fi
+    touch "$NAS_DOWN"
+    exit "$((COPY_FAILED != 0))"
   fi
 fi
+if [ -e "$NAS_DOWN" ]; then
+  log "storage is back - pushing $(cached_count) cached log(s)"
+  rm -f "$NAS_DOWN"
+fi
 
-if ! mkdir -p "$RAW" "$PARSED" "$ARCHIVE" "$MNT" 2>> "$LOG"; then
+if ! mkdir -p "$RAW" "$PARSED" "$ARCHIVE" 2>> "$LOG"; then
   log "cannot create folders in $BASE - is the storage mounted?"
   exit 1
 fi
@@ -100,46 +205,30 @@ for left in "$ARCHIVE"/.incoming-*; do
   [ -e "$left" ] && log "note: an earlier sync didn't finish: $left (left as it is - check it)"
 done
 
-# A mount left behind by an interrupted run would block a new one
-if rc_mounted; then
-  log "removing leftover mount at $MNT"
-  unmount_rc
+# ---- Push the cache to the NAS -------------------------------------------------
+# --ignore-existing never replaces a raw log that is already there, and
+# hidden files (rsync's own unfinished temporary files) are left out.
+# --out-format lists each file that was new to the NAS.
+rsync -rt --ignore-existing --exclude '.*' --out-format='%n' \
+  "$CACHE"/ "$RAW"/ > "$NEWLIST" 2>> "$LOG"
+PUSH_STATUS=$?
+if [ "$PUSH_STATUS" -ne 0 ]; then
+  log "push to the NAS failed (rsync exit code $PUSH_STATUS) - logs stay in the cache"
 fi
 
-# ---- Mount the controller and find its logs -------------------------------------
-# The storage is only visible once the controller is unlocked, so keep
-# retrying every RETRY_EVERY seconds until UNLOCK_WAIT runs out.
-SRC=""
-WAITED=0
-while true; do
-  if MOUNT_ERR=$(jmtpfs "$MNT" 2>&1); then
-    MOUNTED=yes
-    SRC=$(find "$MNT" -maxdepth 6 -type d -name FlightRecord 2>/dev/null | head -n1)
-    [ -n "$SRC" ] && break
-    unmount_rc
+# Delete each cached log that is now on the NAS, byte for byte the same
+# (cmp compares the two files). Its name is added to uploaded.list first,
+# so it isn't copied from the controller again.
+while IFS= read -r f; do
+  rel=${f#"$CACHE"/}
+  if [ -f "$RAW/$rel" ] && cmp -s "$f" "$RAW/$rel"; then
+    grep -qxF "$rel" "$UPLOADED" || echo "$rel" >> "$UPLOADED"
+    rm -f "$f"
+  else
+    log "not confirmed on the NAS yet, kept in the cache: $rel"
   fi
-  if [ "$WAITED" -ge "$UNLOCK_WAIT" ]; then
-    [ -n "$MOUNT_ERR" ] && log "last mount error: $MOUNT_ERR"
-    log "FlightRecord folder not found after ${UNLOCK_WAIT}s - is the controller plugged in and unlocked?"
-    exit 1
-  fi
-  [ "$WAITED" -eq 0 ] && log "waiting for the controller to be unlocked..."
-  sleep "$RETRY_EVERY"
-  WAITED=$((WAITED + RETRY_EVERY))
-done
-
-# ---- Copy new logs -----------------------------------------------------------
-# rsync writes each file under a temporary name and renames it when done,
-# and --ignore-existing never replaces a raw log that is already there.
-# Its exit code is saved straight away, because the next command would
-# overwrite $?.
-rsync -rt --ignore-existing --exclude 'si_cache' --out-format='%n' \
-  "$SRC"/ "$RAW"/ > "$NEWLIST" 2>> "$LOG"
-RSYNC_STATUS=$?
-unmount_rc   # finished with the controller
-if [ "$RSYNC_STATUS" -ne 0 ]; then
-  log "copy failed (rsync exit code $RSYNC_STATUS) - logs fully copied before the error are kept"
-fi
+done < <(find "$CACHE" -type f -not -name '.*')
+find "$CACHE" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # Copy $1 to $2 under a hidden name, then rename it. Never replaces $2.
 safe_copy() {
@@ -169,10 +258,10 @@ archive_parsed() {
   done
 }
 
-# ---- Build this dock session in a hidden folder ---------------------------------
+# ---- Build this session in a hidden folder ---------------------------------------
 NEWCOUNT=$(grep -c '\.txt$' "$NEWLIST" || true)
 if [ "$NEWCOUNT" -gt 0 ]; then
-  log "$NEWCOUNT new flight(s)"
+  log "$NEWCOUNT new flight(s) on the NAS"
   NAME=$STAMP
   n=2
   while [ -e "$ARCHIVE/$NAME" ] || [ -e "$ARCHIVE/.incoming-$NAME" ]; do
@@ -197,7 +286,7 @@ else
 fi
 
 # ---- Parse every raw log that has no CSV yet ------------------------------------
-# That is this dock's new logs, plus any that failed on an earlier dock.
+# That is this sync's new logs, plus any that failed on an earlier one.
 TODO=()
 while IFS= read -r f; do
   base=$(basename "$f" .txt)
@@ -242,7 +331,7 @@ if [ -n "$WORK" ]; then
   fi
 fi
 
-if [ "$RSYNC_STATUS" -ne 0 ]; then
+if [ "$COPY_FAILED" -ne 0 ] || [ "$PUSH_STATUS" -ne 0 ]; then
   log "done, with copy errors (see above)"
   exit 1
 fi
