@@ -57,6 +57,24 @@ After pulling a new version of this repo, run the installer again to install the
 sudo ./install.sh
 ```
 
+### Clean redeploy
+
+To clean up and reinstall from scratch, for example after an update or when something seems stuck, run:
+
+```bash
+sudo ./redeploy.sh
+```
+
+It does these steps:
+1. Stops a sync that is running.
+2. Unmounts the controller if a crashed sync left it mounted.
+3. Removes the old lock file.
+4. Removes the installed files.
+5. Installs everything fresh.
+6. Checks the result.
+
+**It never changes** your API key (`/etc/dji-api-key`), share credentials (`/etc/smb-dji.cred`), storage settings (`/etc/fstab`), your own service settings, your flight logs in `/srv/dji`, or the log file. It compares the key, credentials and fstab before and after, and warns with `!!` if any of them changed. If the packages can't be installed (for example, with no internet), it stops before removing anything.
+
 ## Uninstall
 
 ```bash
