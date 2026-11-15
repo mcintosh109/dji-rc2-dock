@@ -1,6 +1,12 @@
 #!/bin/bash
 # DJI RC 2 flight log sync: copies new logs to storage, parses them,
 # and archives each dock session's raw + parsed files.
+#
+# Exit codes (shown by `systemctl status dji-sync.service`):
+#   0 = success, or nothing to do. A failed parse still counts as
+#       success, because it is retried on the next dock.
+#   1 = the controller or storage could not be reached, the copy
+#       failed, or the sync was stopped before finishing.
 set -u
 MNT=/mnt/rc2
 BASE=/srv/dji
@@ -66,7 +72,7 @@ while true; do
   if [ "$WAITED" -ge "$UNLOCK_WAIT" ]; then
     [ -n "$MOUNT_ERR" ] && log "last mount error: $MOUNT_ERR"
     log "FlightRecord folder not found after ${UNLOCK_WAIT}s - is the controller plugged in and unlocked?"
-    exit 0
+    exit 1
   fi
   [ "$WAITED" -eq 0 ] && log "waiting for the controller to be unlocked..."
   sleep 10
@@ -145,6 +151,7 @@ fi
 
 if [ "$RSYNC_STATUS" -ne 0 ]; then
   log "done, with copy errors (see above)"
+  exit 1
 elif [ "$NEWCOUNT" -gt 0 ]; then
   log "done - archived to archive/$STAMP"
 else

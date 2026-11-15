@@ -1,0 +1,8 @@
+/var/log/dji-sync.log {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
