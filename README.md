@@ -38,7 +38,7 @@ If your controller's USB IDs differ, check `lsusb` and edit `99-dji-rc2.rules`.
 
 ## Usage
 
-Plug in and unlock the controller. Watch progress with:
+Plug in and unlock the controller. You have about 2 minutes to unlock it; the sync waits and retries until then. Watch progress with:
 
 ```bash
 tail -f /var/log/dji-sync.log
@@ -50,4 +50,7 @@ Run a sync manually with `sudo systemctl start dji-sync.service`.
 
 - The controller must be unlocked for its storage to be visible over MTP.
 - Parsing needs internet access: the parser fetches each log's decryption key from DJI. The logs themselves stay local.
-- Only flights that are new since the last dock are parsed and archived.
+- Only flights that are new since the last dock are copied and archived.
+- Any log without a CSV yet is parsed on every dock, so a log that failed to parse (for example with no internet) is retried next time. Its parsed files go into the archive folder that holds its raw log.
+- The sync only runs once `/srv/dji` is mounted. If nothing appears in the log after docking, check `systemctl status dji-sync.service` for a storage mount error.
+- After updating this repo, run `sudo ./install.sh` again to install the new versions.

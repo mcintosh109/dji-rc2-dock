@@ -1,7 +1,13 @@
 [Unit]
 Description=Sync DJI RC 2 flight logs
+# Don't run until the storage at /srv/dji is mounted
+RequiresMountsFor=/srv/dji
+# Parsing needs the internet, so start after the network is up
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStartPre=/bin/sleep 8
 ExecStart=/usr/local/bin/dji-sync.sh
+# Stop the sync if it runs longer than this, e.g. a frozen USB connection
+TimeoutStartSec=30min
