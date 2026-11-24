@@ -1,0 +1,11 @@
+[Unit]
+Description=Put planned routes from DJI Flight Map on the RC 2 while it is plugged in
+# Only does something when linked to the map (sudo dji-map-link), the RC 2
+# is plugged in, and the map has a route waiting for it.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dji-missions --check
+TimeoutStartSec=10min

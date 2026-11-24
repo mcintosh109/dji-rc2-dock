@@ -10,7 +10,9 @@ Turns a Raspberry Pi into a dock for the DJI RC 2 controller. Plug the controlle
 4. If the NAS is mounted, it pushes the cache to the NAS, deletes each cached log once it's confirmed identical on the NAS, parses new logs with [dji-log-parser](https://github.com/lvauvillier/dji-log-parser), and archives the session.
 5. If the NAS is down, the logs wait in the cache. A timer (`dji-sync-flush.timer`) checks every 15 minutes and pushes them as soon as the NAS is back, without re-docking.
 
-Nothing is ever overwritten or deleted on the controller or the NAS.
+Nothing is ever overwritten or deleted on the controller or the NAS. (The one
+exception is a waypoint mission you choose to replace with a planned route:
+see "Routes from DJI Flight Map" below. Its old file is backed up first.)
 
 ## Output layout
 
@@ -53,6 +55,34 @@ tail -f /var/log/dji-sync.log
 
 Run a sync manually with `sudo systemctl start dji-sync.service`.
 
+## Routes from DJI Flight Map (Send to RC 2)
+
+[DJI Flight Map](https://github.com/mcintosh109/dji-flightmap) can plan a
+waypoint route and send it to the RC 2 through this dock. DJI Fly has no
+import button, so the route replaces a **placeholder** mission you made in
+DJI Fly (DJI Fly keeps each mission in
+`Android/data/dji.go.v5/files/waypoint/<UUID>/<UUID>.kmz`).
+
+**Set up once:**
+
+1. On the map: **Settings → RC 2 dock → Make a dock key**. Keep that page open.
+2. On the Pi, in this folder: `git pull`, then `sudo ./redeploy.sh` (installs `dji-missions`, `dji-map-link` and a 2 minute timer).
+3. Run `sudo dji-map-link`. Type the map's address (shown on the settings page), then paste the key (nothing shows while you paste) and press Enter. It should say **Connected to DJI Flight Map**. If the map uses its own private certificate, it shows the certificate's fingerprint and asks before trusting it.
+4. Make a placeholder mission in DJI Fly (any 2 points), then plug the RC 2 in and unlock it. The map's DJI Fly window lists the RC 2's missions within about 2 minutes.
+
+**What `dji-missions` does** (on every plug-in, from `dji-sync.sh`, and every 2 minutes while the RC 2 stays plugged in, from `dji-missions.timer`):
+
+1. Asks the map whether a route is waiting (with the dock key). If not, it doesn't even open the RC 2.
+2. Checks the placeholder on the RC 2 is **exactly** the file you picked on the map (its SHA-256 fingerprint). If it changed since (edited or saved in DJI Fly), nothing is written and the map says why.
+3. Downloads the route and checks its fingerprint.
+4. Backs the old placeholder up: on the Pi in `/var/lib/dji-dock/mission-backups` (always; without it nothing is written) and on the NAS in `/srv/dji/mission-backups` (when mounted).
+5. Writes the new file, reads it back and compares. If writing fails, it puts the old file back.
+6. Tells the map how it went, and sends the RC 2's list of missions again.
+
+It never makes or deletes missions, and a problem with the routes never stops the log sync. Lines starting `missions:` in `/var/log/dji-sync.log` show what it did. Then **open DJI Fly, open the mission and check the route on its map before flying.**
+
+To put an old mission back by hand, copy its file from `mission-backups` (the name is `<date>_<UUID>.kmz`) into the mission's folder on the RC 2, named `<UUID>.kmz`.
+
 ## Updating
 
 After pulling a new version of this repo, run the installer again to install the new files. It won't ask for your API key again if one is saved.
@@ -93,6 +123,12 @@ The tests run `dji-sync.sh` against a fake controller, fake storage and a fake p
 
 ```bash
 bash tests/test-sync.sh
+```
+
+`dji-missions` (routes from DJI Flight Map) has its own tests, with a pretend map and a pretend RC 2:
+
+```bash
+python3 tests/test-missions.py
 ```
 
 ## Troubleshooting

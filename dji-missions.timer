@@ -1,0 +1,9 @@
+[Unit]
+Description=Every 2 minutes, check DJI Flight Map for routes to put on the RC 2
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

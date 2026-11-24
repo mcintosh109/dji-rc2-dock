@@ -53,6 +53,8 @@ NAS_DOWN=$STATE/nas-down               # exists while the NAS is unreachable (so
 LOG=${DJI_LOG:-/var/log/dji-sync.log}
 APIKEY_FILE=${DJI_APIKEY_FILE:-/etc/dji-api-key}
 LOCK=${DJI_LOCK:-/run/dji-sync.lock}
+MISSIONS=${DJI_MISSIONS:-/usr/local/bin/dji-missions}   # routes from DJI Flight Map (dji-missions.py)
+MAP_CONF=${DJI_MAP_CONF:-/etc/dji-map-link.conf}        # made by: sudo dji-map-link
 LOCK_WAIT=${DJI_LOCK_WAIT:-300}         # dock mode: seconds to wait for a running sync to finish
 REQUIRE_MOUNT=${DJI_REQUIRE_MOUNT:-1}   # 0 = /srv/dji is a plain local folder on purpose
 UNLOCK_WAIT=${DJI_UNLOCK_WAIT:-120}     # seconds to wait for the controller to be unlocked
@@ -159,6 +161,15 @@ if [ "$MODE" = dock ]; then
   rsync -rt --ignore-existing --exclude 'si_cache' --exclude-from="$EXCLUDE" \
     "$SRC"/ "$CACHE"/ 2>> "$LOG"
   RSYNC_STATUS=$?
+
+  # Planned routes from DJI Flight Map, if this dock is linked to it
+  # (sudo dji-map-link): put waiting routes on the controller and tell the
+  # map which missions are on it. This never affects the log sync: any
+  # problem is only logged.
+  if [ -x "$MISSIONS" ] && [ -f "$MAP_CONF" ]; then
+    timeout 300 "$MISSIONS" --docked "$MNT" "$SRC" > /dev/null 2>> "$LOG" \
+      || log "routes from the map stopped with a problem (the log sync is not affected)"
+  fi
   unmount_rc   # finished with the controller
   if [ "$RSYNC_STATUS" -ne 0 ]; then
     log "copy from the controller failed (rsync exit code $RSYNC_STATUS) - logs fully copied before the error are kept"

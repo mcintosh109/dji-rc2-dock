@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       # ShellCheck comes pre-installed on GitHub's Ubuntu runners
       - name: Run ShellCheck
-        run: shellcheck *.sh tests/*.sh
+        run: shellcheck *.sh tests/*.sh dji-map-link
 
   tests:
     runs-on: ubuntu-latest
@@ -26,3 +26,5 @@ jobs:
         run: command -v rsync || (sudo apt-get update && sudo apt-get install -y rsync)
       - name: Run tests
         run: bash tests/test-sync.sh
+      - name: Run the dji-missions tests
+        run: python3 tests/test-missions.py
