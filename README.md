@@ -68,7 +68,7 @@ DJI Fly (DJI Fly keeps each mission in
 1. On the map: **Settings → RC 2 dock → Make a dock key**. Keep that page open.
 2. On the Pi, in this folder: `git pull`, then `sudo ./redeploy.sh` (installs `dji-missions`, `dji-map-link` and a 2 minute timer).
 3. Run `sudo dji-map-link`. Type the map's address (shown on the settings page), then paste the key (nothing shows while you paste) and press Enter. It should say **Connected to DJI Flight Map**. If the map uses its own private certificate, it shows the certificate's fingerprint and asks before trusting it.
-4. Make a placeholder mission in DJI Fly (any 2 points), then plug the RC 2 in and unlock it. The map's DJI Fly window lists the RC 2's missions within about 2 minutes.
+4. In DJI Fly, make up to 4 **placeholder** missions with **2, 3, 4 and 5 waypoints** (slots 1 to 4: the number of waypoints tells them apart). Plug the RC 2 in and unlock it. Within about 2 minutes the map's **Settings → RC 2 dock** shows them: confirm each slot once. Only these missions can ever be replaced.
 
 **What `dji-missions` does** (on every plug-in, from `dji-sync.sh`, and every 2 minutes while the RC 2 stays plugged in, from `dji-missions.timer`):
 
