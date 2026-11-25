@@ -4,6 +4,7 @@
 #
 # KEPT - this script never changes these:
 #   /etc/dji-api-key                   your DJI API key
+#   /etc/dji-map-link.conf             the link to DJI Flight Map (dji-map-link)
 #   /etc/smb-dji.cred                  your network share username and password
 #   /etc/fstab                         where your storage is mounted (the upload location)
 #   /etc/systemd/system/dji-sync.service.d/   your own service settings, if any
@@ -29,7 +30,7 @@ if [ "$EUID" -ne 0 ]; then echo "Run with sudo"; exit 1; fi
 # Work from the folder this script is in, so the files below are found
 cd "$(dirname "$0")"
 
-KEEP=(/etc/dji-api-key /etc/smb-dji.cred /etc/fstab)
+KEEP=(/etc/dji-api-key /etc/smb-dji.cred /etc/fstab /etc/dji-map-link.conf)
 MNT=/mnt/rc2
 BASE=/srv/dji
 
@@ -46,7 +47,8 @@ fingerprint() {
 # ---- Before removing anything, make sure the reinstall can work -------------
 echo "== Checking this folder has everything needed..."
 for f in install.sh uninstall.sh dji-sync.sh dji-sync.service dji-sync-flush.service \
-         dji-sync-flush.timer 99-dji-rc2.rules dji-sync.logrotate; do
+         dji-sync-flush.timer 99-dji-rc2.rules dji-sync.logrotate \
+         dji-missions.py dji-map-link dji-missions.service dji-missions.timer; do
   if [ ! -f "$f" ]; then
     echo "Missing $f - nothing was changed. Run this from the dji-rc2-dock folder."
     exit 1
@@ -56,7 +58,7 @@ done
 # Install the packages first: if this fails (e.g. no internet), stop now,
 # while the current install is still in place.
 echo "== Checking packages (this needs the internet)..."
-if ! apt-get install -y jmtpfs rsync fuse3 cifs-utils logrotate; then
+if ! apt-get install -y jmtpfs rsync fuse3 cifs-utils logrotate python3; then
   echo "Could not install packages - nothing was changed. Check the internet connection and try again."
   exit 1
 fi
@@ -66,7 +68,7 @@ BEFORE=$(fingerprint)
 # ---- 1. Stop a sync that is running ------------------------------------------
 echo "== 1. Stopping any running sync..."
 STOPPED=no
-for unit in dji-sync.service dji-sync-flush.service; do
+for unit in dji-sync.service dji-sync-flush.service dji-missions.service; do
   if systemctl is-active --quiet "$unit"; then
     systemctl stop "$unit"
     STOPPED=yes
@@ -108,7 +110,7 @@ PROBLEMS=0
 
 AFTER=$(fingerprint)
 if [ "$BEFORE" = "$AFTER" ]; then
-  echo "   OK   API key, share credentials and fstab are unchanged"
+  echo "   OK   API key, share credentials, fstab and the map link are unchanged"
 else
   echo "   !!   One of these files changed: ${KEEP[*]}"
   PROBLEMS=1
@@ -116,7 +118,9 @@ fi
 
 for f in /usr/local/bin/dji-sync.sh /etc/systemd/system/dji-sync.service \
          /etc/systemd/system/dji-sync-flush.service /etc/systemd/system/dji-sync-flush.timer \
-         /etc/udev/rules.d/99-dji-rc2.rules /etc/logrotate.d/dji-sync; do
+         /etc/udev/rules.d/99-dji-rc2.rules /etc/logrotate.d/dji-sync \
+         /usr/local/bin/dji-missions /usr/local/bin/dji-map-link \
+         /etc/systemd/system/dji-missions.service /etc/systemd/system/dji-missions.timer; do
   if [ -f "$f" ]; then
     echo "   OK   installed $f"
   else
@@ -137,6 +141,18 @@ if systemctl is-active --quiet dji-sync-flush.timer; then
 else
   echo "   !!   the 15 minute push timer is not running"
   PROBLEMS=1
+fi
+
+if systemctl is-active --quiet dji-missions.timer; then
+  echo "   OK   the 2 minute route check (DJI Flight Map) is running"
+else
+  echo "   !!   the 2 minute route check (DJI Flight Map) is not running"
+  PROBLEMS=1
+fi
+if [ -f /etc/dji-map-link.conf ]; then
+  echo "   OK   linked to DJI Flight Map ($(grep '^MAP_URL=' /etc/dji-map-link.conf | cut -d= -f2-))"
+else
+  echo "   note not linked to DJI Flight Map yet (to send routes to the RC 2: sudo dji-map-link)"
 fi
 
 # Report on the storage, without changing it. Looking inside connects an

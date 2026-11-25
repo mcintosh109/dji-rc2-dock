@@ -1,0 +1,7 @@
+#!/bin/bash
+# Links this dock to DJI Flight Map, so planned routes can be put on the
+# RC 2 ("Send to RC 2" in the map's flight planner). Run with:
+#   sudo dji-map-link
+# It asks for the map's address and the dock key (made on the map: Settings
+# -> RC 2 dock), tests them, and saves them in /etc/dji-map-link.conf.
+exec /usr/local/bin/dji-missions --link "$@"

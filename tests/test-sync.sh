@@ -248,6 +248,30 @@ check "logs already on the NAS are not archived again" [ "$(sessions)" -eq "$s_b
 check "  ...the cache is empty again afterwards" [ "$(cached)" -eq 0 ]
 check "  ...and they are remembered as uploaded" grep -qxF "FlightRecord_2026-01-10_A.txt" "$T/state/uploaded.list"
 
+echo "Routes from DJI Flight Map (dji-missions)"
+# fake dji-missions: records how it was called, and whether the controller was mounted then
+{
+  echo '#!/bin/bash'
+  echo "echo \"\$* mounted:\$([ -d '$T/mnt/Internal shared storage' ] && echo yes || echo no)\" >> '$T/missions.calls'"
+  # shellcheck disable=SC2016  # written into the fake as it is, expanded when the fake runs
+  echo 'exit "${FAKE_MISSIONS_EXIT:-0}"'
+} > "$T/bin/fake-missions"
+chmod +x "$T/bin/fake-missions"
+export DJI_MISSIONS="$T/bin/fake-missions" DJI_MAP_CONF="$T/map-link.conf"
+rm -f "$T/missions.calls"
+bash "$SYNC"
+check "not linked to the map: dji-missions isn't run" bash -c "[ ! -e '$T/missions.calls' ]"
+echo "MAP_URL=https://map.example.test" > "$T/map-link.conf"
+flight FlightRecord_2026-02-05_K
+bash "$SYNC"
+check "linked: dji-missions runs while the controller is mounted" grep -q -- "--docked $T/mnt .*FlightRecord mounted:yes" "$T/missions.calls"
+check "  ...and the logs are still synced" bash -c "ls '$T'/storage/archive/*/raw/FlightRecord_2026-02-05_K.txt"
+flight FlightRecord_2026-02-05_L
+FAKE_MISSIONS_EXIT=1 bash "$SYNC"; code=$?
+check "a problem with the routes doesn't stop the log sync" bash -c "[ $code -eq 0 ] && ls '$T'/storage/archive/*/raw/FlightRecord_2026-02-05_L.txt"
+check "  ...it is logged" grep -q "routes from the map stopped with a problem" "$T/sync.log"
+unset DJI_MISSIONS DJI_MAP_CONF
+
 echo
 echo "$PASSED passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

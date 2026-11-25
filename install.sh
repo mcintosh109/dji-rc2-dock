@@ -17,7 +17,8 @@ echo "Installing packages..."
 # fuse3: needed by jmtpfs, and provides fusermount for unmounting
 # cifs-utils: mounts SMB/Windows network shares
 # logrotate: keeps the log file from growing forever
-apt-get install -y jmtpfs rsync fuse3 cifs-utils logrotate
+# python3: runs dji-missions (routes from DJI Flight Map)
+apt-get install -y jmtpfs rsync fuse3 cifs-utils logrotate python3
 
 echo "Installing files..."
 # install copies a file and sets its permissions in one step
@@ -27,8 +28,15 @@ install -m 644 99-dji-rc2.rules /etc/udev/rules.d/99-dji-rc2.rules
 install -m 644 dji-sync.logrotate /etc/logrotate.d/dji-sync
 install -m 644 dji-sync-flush.service /etc/systemd/system/dji-sync-flush.service
 install -m 644 dji-sync-flush.timer /etc/systemd/system/dji-sync-flush.timer
+# Routes from DJI Flight Map: the program, its setup command, and the
+# 2 minute check while the RC 2 is plugged in
+install -m 755 dji-missions.py /usr/local/bin/dji-missions
+install -m 755 dji-map-link /usr/local/bin/dji-map-link
+install -m 644 dji-missions.service /etc/systemd/system/dji-missions.service
+install -m 644 dji-missions.timer /etc/systemd/system/dji-missions.timer
 # /var/lib/dji-dock holds the cache: logs waiting to be pushed to the NAS
-mkdir -p /mnt/rc2 /srv/dji /var/lib/dji-dock/cache
+# mission-backups: each RC 2 mission replaced by a route from the map
+mkdir -p /mnt/rc2 /srv/dji /var/lib/dji-dock/cache /var/lib/dji-dock/mission-backups
 
 # Tell systemd and udev to load the new files
 systemctl daemon-reload
@@ -36,6 +44,8 @@ udevadm control --reload-rules
 
 # Start the 15 minute timer now, and at every boot
 systemctl enable --now dji-sync-flush.timer
+# Start the 2 minute route check (it does nothing until: sudo dji-map-link)
+systemctl enable --now dji-missions.timer
 
 if [ ! -f /etc/dji-api-key ]; then
   # [ -t 0 ] is true when someone is typing at a terminal
@@ -54,3 +64,4 @@ fi
 
 command -v dji-log >/dev/null || echo "Note: dji-log not found. Install it to /usr/local/bin to enable parsing."
 echo "Done. Mount your storage at /srv/dji (see examples/fstab.example), then dock the controller."
+[ -f /etc/dji-map-link.conf ] || echo "To put planned routes from DJI Flight Map on the RC 2: sudo dji-map-link"
